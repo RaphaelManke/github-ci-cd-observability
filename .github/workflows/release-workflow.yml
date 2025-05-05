@@ -1,0 +1,967 @@
+name: Release Workflow
+
+# This workflow can be triggered manually with configurable parameters
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Type of release'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      target_environments:
+        description: 'Target environments for deployment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+          - staging,production
+      debug_mode:
+        description: 'Enable debug mode with verbose logging'
+        required: false
+        default: 'false'
+        type: boolean
+      skip_tests:
+        description: 'Skip test execution (not recommended)'
+        required: false
+        default: 'false'
+        type: boolean
+      deployment_strategy:
+        description: 'Deployment strategy to use'
+        required: true
+        default: 'blue-green'
+        type: choice
+        options:
+          - blue-green
+          - canary
+          - all-at-once
+      # New simulation parameters
+      failure_simulation:
+        description: 'Simulate specific failure mode'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - build-failure
+          - test-failure
+          - quality-failure
+          - publish-failure
+          - deploy-failure
+          - random-failure
+      latency_simulation:
+        description: 'Simulate latency/performance issues'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - slow-build
+          - slow-tests
+          - slow-deployment
+          - network-issues
+          - resource-contention
+      failure_probability:
+        description: 'Probability of failure (when failure simulation is enabled)'
+        required: false
+        default: '50'
+        type: choice
+        options:
+          - '10'  # 10% chance of failure
+          - '25'  # 25% chance of failure
+          - '50'  # 50% chance of failure
+          - '75'  # 75% chance of failure
+          - '100' # 100% chance of failure
+      latency_severity:
+        description: 'Severity of latency (when latency simulation is enabled)'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - low      # Slight delays
+          - medium   # Noticeable delays
+          - high     # Significant delays
+          - extreme  # Very long delays
+      simulate_commit_keywords:
+        description: 'Simulate commit message keywords for behavior changes'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+# Environment variables used throughout the workflow
+env:
+  VERSION: '1.0.0'  # Base version, will be updated based on release_type
+  REGISTRY_URL: 'ghcr.io'
+  DEBUG_MODE: ${{ github.event.inputs.debug_mode == 'true' }}
+  # New environment variables for simulations
+  FAILURE_SIMULATION: ${{ github.event.inputs.failure_simulation || 'none' }}
+  LATENCY_SIMULATION: ${{ github.event.inputs.latency_simulation || 'none' }}
+  FAILURE_PROBABILITY: ${{ github.event.inputs.failure_probability || '50' }}
+  LATENCY_SEVERITY: ${{ github.event.inputs.latency_severity || 'medium' }}
+  COMMIT_KEYWORDS: ${{ github.event.inputs.simulate_commit_keywords || github.event.head_commit.message || '' }}
+
+jobs:
+  # Preflight job to set up version and validate inputs
+  preflight:
+    name: 'Preflight Checks'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
+      matrix_os: ${{ steps.set-matrix.outputs.matrix_os }}
+      environments: ${{ steps.parse-envs.outputs.environments }}
+      priority: ${{ steps.parse-keywords.outputs.priority }}
+      skip_quality: ${{ steps.parse-keywords.outputs.skip_quality }}
+      emergency_mode: ${{ steps.parse-keywords.outputs.emergency_mode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set version number
+        id: set-version
+        run: |
+          BASE_VERSION="1.0.0"
+          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+          
+          # Simple version bumping logic
+          if [ "$RELEASE_TYPE" == "patch" ]; then
+            NEW_VERSION="1.0.1"
+          elif [ "$RELEASE_TYPE" == "minor" ]; then
+            NEW_VERSION="1.1.0"
+          elif [ "$RELEASE_TYPE" == "major" ]; then
+            NEW_VERSION="2.0.0"
+          else
+            NEW_VERSION="$BASE_VERSION"
+          fi
+          
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Set version to $NEW_VERSION based on release type: $RELEASE_TYPE"
+
+      - name: Set matrix configuration
+        id: set-matrix
+        run: |
+          # Define OS matrix based on release type
+          if [ "${{ github.event.inputs.release_type }}" == "major" ]; then
+            echo "matrix_os=[\"ubuntu-latest\", \"windows-latest\", \"macos-latest\"]" >> $GITHUB_OUTPUT
+          else
+            echo "matrix_os=[\"ubuntu-latest\"]" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Parse target environments
+        id: parse-envs
+        run: |
+          ENVS="${{ github.event.inputs.target_environments }}"
+          echo "environments=$ENVS" >> $GITHUB_OUTPUT
+          echo "Target environments: $ENVS"
+
+      - name: Parse commit message keywords
+        id: parse-keywords
+        run: |
+          COMMIT_MSG="${{ env.COMMIT_KEYWORDS }}"
+          PRIORITY="normal"
+          SKIP_QUALITY="false"
+          EMERGENCY_MODE="false"
+          
+          echo "Analyzing commit message or simulated keywords: '$COMMIT_MSG'"
+          
+          # Check for priority indicators
+          if echo "$COMMIT_MSG" | grep -i -E "\[urgent\]|\[high-priority\]|\[priority\]" > /dev/null; then
+            PRIORITY="high"
+            echo "High priority build detected!"
+          fi
+          
+          # Check for quality bypass
+          if echo "$COMMIT_MSG" | grep -i -E "\[skip-quality\]|\[no-quality\]" > /dev/null; then
+            SKIP_QUALITY="true"
+            echo "Quality checks will be skipped as requested"
+          fi
+          
+          # Check for emergency hotfix
+          if echo "$COMMIT_MSG" | grep -i -E "\[hotfix\]|\[emergency\]|\[critical\]" > /dev/null; then
+            EMERGENCY_MODE="true"
+            echo "Emergency hotfix mode activated!"
+          fi
+          
+          echo "priority=$PRIORITY" >> $GITHUB_OUTPUT
+          echo "skip_quality=$SKIP_QUALITY" >> $GITHUB_OUTPUT
+          echo "emergency_mode=$EMERGENCY_MODE" >> $GITHUB_OUTPUT
+
+      - name: Simulate preflight failures
+        if: ${{ env.FAILURE_SIMULATION == 'random-failure' }}
+        run: |
+          # Random failure simulation based on probability
+          if [ "${{ env.FAILURE_SIMULATION }}" == "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            if [ $RANDOM_NUM -le ${{ env.FAILURE_PROBABILITY }} ]; then
+              echo "Simulating random preflight failure (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+              exit 1
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            fi
+          fi
+
+  # Build job with matrix strategy for multiple platforms
+  build:
+    name: 'Build'
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: ${{ fromJson(needs.preflight.outputs.matrix_os) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up environment
+        run: |
+          if [ "${{ env.DEBUG_MODE }}" == "true" ]; then
+            echo "Debug mode enabled"
+            set -x
+          fi
+          
+          # Create artifacts directory
+          mkdir -p artifacts
+      
+      - name: Simulate build latency
+        if: ${{ env.LATENCY_SIMULATION == 'slow-build' || env.LATENCY_SIMULATION == 'resource-contention' }}
+        shell: bash
+        run: |
+          echo "Simulating build latency (${{ env.LATENCY_SIMULATION }}, severity: ${{ env.LATENCY_SEVERITY }})"
+          
+          # Different delay duration based on severity
+          case "${{ env.LATENCY_SEVERITY }}" in
+            "low")
+              SLEEP_TIME=30
+              ;;
+            "medium")
+              SLEEP_TIME=60
+              ;;
+            "high")
+              SLEEP_TIME=120
+              ;;
+            "extreme")
+              SLEEP_TIME=240
+              ;;
+            *)
+              SLEEP_TIME=60
+              ;;
+          esac
+          
+          echo "Introducing artificial delay of ${SLEEP_TIME} seconds..."
+          
+          # For resource contention, also simulate CPU burn
+          if [ "${{ env.LATENCY_SIMULATION }}" == "resource-contention" ]; then
+            echo "Simulating CPU resource contention..."
+            end=$((SECONDS+$SLEEP_TIME))
+            while [ $SECONDS -lt $end ]; do
+              # Generate CPU load with prime calculation
+              for i in {1..10000}; do
+                echo "scale=10; a(1)*4" | bc -l > /dev/null
+              done
+              sleep 1
+            done
+          else
+            sleep $SLEEP_TIME
+          fi
+          
+          echo "Latency simulation completed"
+
+      - name: Run build script
+        shell: bash
+        run: |
+          chmod +x ./scripts/build.sh
+          
+          # Pass latency parameter to build script if needed
+          LATENCY=""
+          if [ "${{ env.LATENCY_SIMULATION }}" = "slow-build" ] || [ "${{ env.LATENCY_SIMULATION }}" = "network-issues" ]; then
+            LATENCY="--simulate-latency=${{ env.LATENCY_SEVERITY }}"
+          fi
+          
+          ./scripts/build.sh ${{ matrix.os }} $LATENCY
+        
+      - name: Simulate build failure
+        if: ${{ env.FAILURE_SIMULATION == 'build-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # Determine if we should trigger a failure
+          SHOULD_FAIL="false"
+          
+          if [ "${{ env.FAILURE_SIMULATION }}" = "build-failure" ]; then
+            SHOULD_FAIL="true"
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            if [ $RANDOM_NUM -le ${{ env.FAILURE_PROBABILITY }} ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random build failure (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated build failure for ${{ matrix.os }}"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts-${{ matrix.os }}
+          path: artifacts/
+          retention-days: 1
+
+  # Test job with matrix strategy for different test types
+  test:
+    name: 'Test (${{ matrix.test-type }} on ${{ matrix.environment }})'
+    needs: [preflight, build]
+    if: ${{ github.event.inputs.skip_tests != 'true' && needs.preflight.outputs.emergency_mode != 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: ['unit', 'integration', 'e2e']
+        environment: ['dev', 'staging']
+        exclude:
+          # Skip e2e tests on dev environment
+          - test-type: 'e2e'
+            environment: 'dev'
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts-ubuntu-latest
+          path: artifacts/
+          
+      - name: Priority configuration
+        run: |
+          if [ "${{ needs.preflight.outputs.priority }}" = "high" ]; then
+            echo "Running in high-priority mode - optimizing for speed"
+            echo "OPTIMIZE_FOR_SPEED=true" >> $GITHUB_ENV
+          else
+            echo "OPTIMIZE_FOR_SPEED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Simulate test latency
+        if: ${{ env.LATENCY_SIMULATION == 'slow-tests' || env.LATENCY_SIMULATION == 'network-issues' }}
+        shell: bash
+        run: |
+          echo "Simulating test latency (${{ env.LATENCY_SIMULATION }}, severity: ${{ env.LATENCY_SEVERITY }})"
+          
+          # Skip latency in high-priority mode
+          if [ "${{ env.OPTIMIZE_FOR_SPEED }}" = "true" ]; then
+            echo "Skipping latency simulation due to high-priority build"
+            exit 0
+          fi
+          
+          # Different delay duration based on severity and test type
+          BASE_TIME=0
+          case "${{ env.LATENCY_SEVERITY }}" in
+            "low")
+              BASE_TIME=15
+              ;;
+            "medium")
+              BASE_TIME=30
+              ;;
+            "high")
+              BASE_TIME=60
+              ;;
+            "extreme")
+              BASE_TIME=120
+              ;;
+            *)
+              BASE_TIME=30
+              ;;
+          esac
+          
+          # E2E tests take longer
+          if [ "${{ matrix.test-type }}" = "e2e" ]; then
+            SLEEP_TIME=$((BASE_TIME * 2))
+          else
+            SLEEP_TIME=$BASE_TIME
+          fi
+          
+          echo "Introducing artificial delay of ${SLEEP_TIME} seconds for ${{ matrix.test-type }} tests..."
+          sleep $SLEEP_TIME
+          
+          # For network issues, simulate intermittent failures that eventually succeed
+          if [ "${{ env.LATENCY_SIMULATION }}" = "network-issues" ]; then
+            echo "Simulating network connectivity issues..."
+            for i in {1..3}; do
+              echo "Network connection attempt $i failed..."
+              sleep 5
+            done
+            echo "Network connection restored, continuing tests..."
+          fi
+          
+          echo "Latency simulation completed"
+
+      - name: Run test script
+        shell: bash
+        run: |
+          chmod +x ./scripts/test.sh
+          
+          # Determine verbosity based on debug mode
+          VERBOSE=${{ env.DEBUG_MODE }}
+          
+          # Override test behavior based on priority
+          if [ "${{ env.OPTIMIZE_FOR_SPEED }}" = "true" ] && [ "${{ matrix.test-type }}" = "e2e" ]; then
+            echo "Running abbreviated E2E tests due to high priority"
+            EXTRA_ARGS="--abbrev"
+          else
+            EXTRA_ARGS=""
+          fi
+          
+          ./scripts/test.sh ${{ matrix.environment }} ${{ matrix.test-type }} $VERBOSE $EXTRA_ARGS
+        
+      - name: Simulate test failure
+        if: ${{ env.FAILURE_SIMULATION == 'test-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # Determine if we should trigger a failure
+          SHOULD_FAIL="false"
+          
+          # Only fail certain test types for more realistic simulation
+          if [ "${{ env.FAILURE_SIMULATION }}" = "test-failure" ]; then
+            # E2E tests are more likely to fail
+            if [ "${{ matrix.test-type }}" = "e2e" ]; then
+              SHOULD_FAIL="true"
+            elif [ "${{ matrix.test-type }}" = "integration" ] && [ $(( RANDOM % 2 )) -eq 0 ]; then
+              SHOULD_FAIL="true"
+            fi
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            if [ $RANDOM_NUM -le ${{ env.FAILURE_PROBABILITY }} ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random test failure (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated test failure for ${{ matrix.test-type }} in ${{ matrix.environment }}"
+            exit 1
+          fi
+
+  # Quality check job
+  quality:
+    name: 'Quality Check'
+    needs: [preflight, build]
+    if: ${{ needs.preflight.outputs.skip_quality != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Priority configuration
+        run: |
+          if [ "${{ needs.preflight.outputs.priority }}" = "high" ]; then
+            echo "Running in high-priority mode - using relaxed quality thresholds"
+            echo "LINTING_THRESHOLD=75" >> $GITHUB_ENV
+            echo "SECURITY_THRESHOLD=80" >> $GITHUB_ENV
+          else
+            echo "LINTING_THRESHOLD=85" >> $GITHUB_ENV
+            echo "SECURITY_THRESHOLD=90" >> $GITHUB_ENV
+          fi
+          
+      - name: Simulate quality check latency
+        if: ${{ env.LATENCY_SIMULATION == 'resource-contention' }}
+        shell: bash
+        run: |
+          echo "Simulating quality check latency (resource contention, severity: ${{ env.LATENCY_SEVERITY }})"
+          
+          # Different delay duration based on severity
+          case "${{ env.LATENCY_SEVERITY }}" in
+            "low")
+              SLEEP_TIME=15
+              ;;
+            "medium")
+              SLEEP_TIME=30
+              ;;
+            "high")
+              SLEEP_TIME=60
+              ;;
+            "extreme")
+              SLEEP_TIME=90
+              ;;
+            *)
+              SLEEP_TIME=30
+              ;;
+          esac
+          
+          echo "Introducing artificial delay of ${SLEEP_TIME} seconds..."
+          sleep $SLEEP_TIME
+          
+          echo "Latency simulation completed"
+
+      - name: Run linting
+        shell: bash
+        run: |
+          chmod +x ./scripts/quality-check.sh
+          ./scripts/quality-check.sh "linting" ${{ env.LINTING_THRESHOLD }}
+
+      - name: Simulate quality failure (linting)
+        if: ${{ env.FAILURE_SIMULATION == 'quality-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # Determine if we should trigger a failure
+          SHOULD_FAIL="false"
+          
+          if [ "${{ env.FAILURE_SIMULATION }}" = "quality-failure" ]; then
+            SHOULD_FAIL="true"
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            if [ $RANDOM_NUM -le ${{ env.FAILURE_PROBABILITY }} ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random linting failure (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated linting quality failure - code style issues detected"
+            exit 1
+          fi
+
+      - name: Run security scan
+        shell: bash
+        run: |
+          chmod +x ./scripts/quality-check.sh
+          ./scripts/quality-check.sh "security" ${{ env.SECURITY_THRESHOLD }}
+          
+      - name: Simulate quality failure (security)
+        if: ${{ env.FAILURE_SIMULATION == 'quality-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # For security checks, we'll use a different probability to make it seem realistic
+          # Security checks don't fail as often as linting
+          SHOULD_FAIL="false"
+          
+          if [ "${{ env.FAILURE_SIMULATION }}" = "quality-failure" ]; then
+            # 50% chance of security failure when quality failure is selected
+            if [ $(( RANDOM % 2 )) -eq 0 ]; then
+              SHOULD_FAIL="true"
+            fi
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            ADJUSTED_PROBABILITY=$(( ${{ env.FAILURE_PROBABILITY }} / 2 )) # Half the probability for security
+            if [ $RANDOM_NUM -le $ADJUSTED_PROBABILITY ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random security scan failure (rolled $RANDOM_NUM, threshold $ADJUSTED_PROBABILITY)"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold $ADJUSTED_PROBABILITY)"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated security quality failure - security vulnerabilities detected"
+            exit 1
+          fi
+
+      - name: Upload quality reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-reports
+          path: reports/
+          retention-days: 7
+
+  # Publish job to different registries
+  publish:
+    name: 'Publish'
+    needs: [preflight, build, test, quality]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+      
+      - name: Simulate publish latency
+        if: ${{ env.LATENCY_SIMULATION == 'network-issues' }}
+        shell: bash
+        run: |
+          echo "Simulating network issues during publish process (severity: ${{ env.LATENCY_SEVERITY }})"
+          
+          # Different delay duration based on severity
+          case "${{ env.LATENCY_SEVERITY }}" in
+            "low")
+              ATTEMPTS=2
+              DELAY_BETWEEN=10
+              ;;
+            "medium")
+              ATTEMPTS=3
+              DELAY_BETWEEN=15
+              ;;
+            "high")
+              ATTEMPTS=5
+              DELAY_BETWEEN=20
+              ;;
+            "extreme")
+              ATTEMPTS=8
+              DELAY_BETWEEN=30
+              ;;
+            *)
+              ATTEMPTS=3
+              DELAY_BETWEEN=15
+              ;;
+          esac
+          
+          echo "Simulating $ATTEMPTS failed network attempts with ${DELAY_BETWEEN}s between retries"
+          
+          for (( i=1; i<=$ATTEMPTS; i++ ))
+          do
+            echo "Publish attempt $i failed - network timeout..."
+            sleep $DELAY_BETWEEN
+            echo "Retrying..."
+          done
+          
+          echo "Network connection established, continuing with publish"
+
+      - name: Publish to registry
+        shell: bash
+        run: |
+          chmod +x ./scripts/publish.sh
+          
+          # Set emergency flag if needed
+          EMERGENCY_FLAG=""
+          if [ "${{ needs.preflight.outputs.emergency_mode }}" = "true" ]; then
+            EMERGENCY_FLAG="--emergency"
+            echo "Publishing with emergency flag for expedited process"
+          fi
+          
+          # For each platform, publish to registry
+          for platform in $(echo ${{ needs.preflight.outputs.matrix_os }} | tr -d '[]"' | tr ',' ' '); do
+            ./scripts/publish.sh "$platform" "${{ env.REGISTRY_URL }}" "${{ needs.preflight.outputs.version }}" $EMERGENCY_FLAG
+          done
+        
+      - name: Simulate publish failure
+        if: ${{ env.FAILURE_SIMULATION == 'publish-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # Determine if we should trigger a failure
+          SHOULD_FAIL="false"
+          
+          if [ "${{ env.FAILURE_SIMULATION }}" = "publish-failure" ]; then
+            SHOULD_FAIL="true"
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            if [ $RANDOM_NUM -le ${{ env.FAILURE_PROBABILITY }} ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random publish failure (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold ${{ env.FAILURE_PROBABILITY }})"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated publish failure - error pushing to registry"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.release_type != 'patch' }}
+        run: |
+          echo "Creating GitHub Release for version ${{ needs.preflight.outputs.version }}"
+          # This would use the GitHub API to create a release
+          # In this demo, we're just simulating it
+          echo "Release v${{ needs.preflight.outputs.version }}" > release-notes.md
+          echo "Automatically generated release" >> release-notes.md
+          echo "Version: ${{ needs.preflight.outputs.version }}" >> release-notes.md
+          echo "Created at: $(date)" >> release-notes.md
+          
+          # In a real workflow, you would use the GitHub API or actions/create-release
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-${{ needs.preflight.outputs.version }}
+          path: |
+            release-notes.md
+            publication-history/
+          retention-days: 30
+
+  # Deploy job for different environments
+  deploy:
+    name: 'Deploy to ${{ matrix.environment }}'
+    needs: [preflight, publish]
+    if: ${{ always() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson('["' + join(split(needs.preflight.outputs.environments, ','), '","') + '"]') }}
+      fail-fast: false
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-${{ needs.preflight.outputs.version }}
+          path: release/
+          
+      - name: Configure emergency deployment
+        run: |
+          # Check if this is an emergency hotfix
+          if [ "${{ needs.preflight.outputs.emergency_mode }}" = "true" ]; then
+            echo "DEPLOY_FLAGS=--emergency --skip-validation" >> $GITHUB_ENV
+            echo "Running emergency deployment with minimum validation"
+          else
+            echo "DEPLOY_FLAGS=" >> $GITHUB_ENV
+          fi
+      
+      - name: Simulate deployment latency
+        if: ${{ env.LATENCY_SIMULATION == 'slow-deployment' || env.LATENCY_SIMULATION == 'network-issues' }}
+        shell: bash
+        run: |
+          echo "Simulating deployment latency (${{ env.LATENCY_SIMULATION }}, severity: ${{ env.LATENCY_SEVERITY }})"
+          
+          # Skip some latency in emergency mode
+          if [ "${{ needs.preflight.outputs.emergency_mode }}" = "true" ]; then
+            echo "Reducing latency simulation due to emergency deployment"
+            SEVERITY_LEVEL="low"
+          else
+            SEVERITY_LEVEL="${{ env.LATENCY_SEVERITY }}"
+          fi
+          
+          # Different delay duration based on severity and environment
+          BASE_TIME=0
+          case "$SEVERITY_LEVEL" in
+            "low")
+              BASE_TIME=30
+              ;;
+            "medium")
+              BASE_TIME=60
+              ;;
+            "high")
+              BASE_TIME=120
+              ;;
+            "extreme")
+              BASE_TIME=180
+              ;;
+            *)
+              BASE_TIME=60
+              ;;
+          esac
+          
+          # Production environments take longer
+          if [ "${{ matrix.environment }}" = "production" ]; then
+            SLEEP_TIME=$((BASE_TIME * 2))
+            echo "Production deployment estimated time: ${SLEEP_TIME} seconds"
+          else
+            SLEEP_TIME=$BASE_TIME
+            echo "Staging deployment estimated time: ${SLEEP_TIME} seconds"
+          fi
+          
+          # Simulate the deployment steps with progress updates
+          echo "Preparing deployment package..."
+          sleep $((SLEEP_TIME / 6))
+          
+          echo "Connecting to target environment..."
+          sleep $((SLEEP_TIME / 6))
+          
+          if [ "${{ env.LATENCY_SIMULATION }}" = "network-issues" ]; then
+            echo "Network connection timed out, retrying..."
+            sleep 10
+            echo "Connection established"
+          fi
+          
+          echo "Uploading deployment package ($(($SLEEP_TIME / 2))s)..."
+          progress_interval=$(($SLEEP_TIME / 10))
+          for i in {1..5}; do
+            sleep $progress_interval
+            echo "$((i * 20))% complete..."
+          done
+          
+          echo "Finalizing deployment..."
+          sleep $((SLEEP_TIME / 6))
+          
+          echo "Deployment simulation completed"
+
+      - name: Deploy to environment
+        shell: bash
+        run: |
+          chmod +x ./scripts/deploy.sh
+          
+          # Use strategy and pass any emergency flags
+          ./scripts/deploy.sh "${{ matrix.environment }}" "${{ github.event.inputs.deployment_strategy }}" "${{ needs.preflight.outputs.version }}" ${{ env.DEPLOY_FLAGS }}
+        
+      - name: Simulate deployment failure
+        if: ${{ env.FAILURE_SIMULATION == 'deploy-failure' || env.FAILURE_SIMULATION == 'random-failure' }}
+        shell: bash
+        run: |
+          # Determine if we should trigger a failure
+          SHOULD_FAIL="false"
+          
+          if [ "${{ env.FAILURE_SIMULATION }}" = "deploy-failure" ]; then
+            # Production deployments are more likely to fail in the simulation
+            if [ "${{ matrix.environment }}" = "production" ]; then
+              SHOULD_FAIL="true"
+            elif [ "${{ matrix.environment }}" = "staging" ] && [ $(( RANDOM % 3 )) -eq 0 ]; then
+              # 1/3 chance for staging to fail
+              SHOULD_FAIL="true"
+            fi
+          elif [ "${{ env.FAILURE_SIMULATION }}" = "random-failure" ]; then
+            RANDOM_NUM=$(( RANDOM % 100 + 1 ))
+            THRESHOLD=${{ env.FAILURE_PROBABILITY }}
+            
+            # Production has slightly higher failure threshold for more realistic simulation
+            if [ "${{ matrix.environment }}" = "production" ]; then
+              THRESHOLD=$(( THRESHOLD + 10 ))
+              if [ $THRESHOLD -gt 100 ]; then
+                THRESHOLD=100
+              fi
+            fi
+            
+            if [ $RANDOM_NUM -le $THRESHOLD ]; then
+              SHOULD_FAIL="true"
+              echo "Simulating random deployment failure (rolled $RANDOM_NUM, threshold $THRESHOLD)"
+            else
+              echo "Random failure check passed (rolled $RANDOM_NUM, threshold $THRESHOLD)"
+            fi
+          fi
+          
+          # Exit with error if we should fail
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "::error::Simulated deployment failure in ${{ matrix.environment }} environment"
+            echo "Log trace: Failed to start application services after deployment"
+            exit 1
+          fi
+
+      - name: Verify deployment
+        if: ${{ env.DEBUG_MODE == 'true' || needs.preflight.outputs.emergency_mode == 'true' }}
+        run: |
+          echo "Running extended verification for ${{ matrix.environment }}..."
+          
+          # In emergency mode, do more thorough verification
+          if [ "${{ needs.preflight.outputs.emergency_mode }}" = "true" ]; then
+            echo "Emergency deployment - performing additional validation checks"
+            sleep 10
+            echo "✅ Core services check: PASSED"
+            sleep 5
+            echo "✅ API response check: PASSED"
+            sleep 5
+            echo "✅ Database connection check: PASSED"
+          elif [ "${{ env.DEBUG_MODE }}" = "true" ]; then
+            # Standard debug mode verification
+            sleep 5
+            echo "✅ Deployment verification completed"
+          fi
+
+  # Final notification job
+  notify:
+    name: 'Send Notifications'
+    needs: [preflight, deploy]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare notification content
+        run: |
+          echo "Release workflow completed with status: ${{ job.status }}" > notification.txt
+          echo "Version: ${{ needs.preflight.outputs.version }}" >> notification.txt
+          echo "Release type: ${{ github.event.inputs.release_type }}" >> notification.txt
+          echo "Target environments: ${{ needs.preflight.outputs.environments }}" >> notification.txt
+          echo "Commit keywords: ${{ env.COMMIT_KEYWORDS }}" >> notification.txt
+          echo "Priority mode: ${{ needs.preflight.outputs.priority }}" >> notification.txt
+          echo "Emergency mode: ${{ needs.preflight.outputs.emergency_mode }}" >> notification.txt
+          
+          # Add simulation information for better observability
+          if [ "${{ env.FAILURE_SIMULATION }}" != "none" ]; then
+            echo "⚠️ Failure simulation: ${{ env.FAILURE_SIMULATION }} (probability: ${{ env.FAILURE_PROBABILITY }}%)" >> notification.txt
+          fi
+          
+          if [ "${{ env.LATENCY_SIMULATION }}" != "none" ]; then
+            echo "⚠️ Latency simulation: ${{ env.LATENCY_SIMULATION }} (severity: ${{ env.LATENCY_SEVERITY }})" >> notification.txt
+          fi
+          
+          echo "Completed at: $(date)" >> notification.txt
+          
+          # In a real workflow, you would send notifications via Slack, email, etc.
+          cat notification.txt
+
+      - name: Upload notification summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: workflow-summary
+          path: notification.txt
+          retention-days: 7
+          
+      - name: Generate workflow observability report
+        run: |
+          echo "# GitHub CI/CD Workflow Observability Report" > workflow-report.md
+          echo "## Summary" >> workflow-report.md
+          echo "- **Workflow**: Release Workflow" >> workflow-report.md
+          echo "- **Run Time**: $(date)" >> workflow-report.md
+          echo "- **Version**: ${{ needs.preflight.outputs.version }}" >> workflow-report.md
+          echo "- **Overall Status**: ${{ job.status }}" >> workflow-report.md
+          echo "" >> workflow-report.md
+          
+          echo "## Configuration" >> workflow-report.md
+          echo "- **Release Type**: ${{ github.event.inputs.release_type }}" >> workflow-report.md
+          echo "- **Target Environments**: ${{ needs.preflight.outputs.environments }}" >> workflow-report.md
+          echo "- **Deployment Strategy**: ${{ github.event.inputs.deployment_strategy }}" >> workflow-report.md
+          echo "- **Debug Mode**: ${{ env.DEBUG_MODE }}" >> workflow-report.md
+          echo "" >> workflow-report.md
+          
+          echo "## Behavioral Triggers" >> workflow-report.md
+          echo "- **Commit Keywords**: ${{ env.COMMIT_KEYWORDS }}" >> workflow-report.md
+          echo "- **Priority Mode**: ${{ needs.preflight.outputs.priority }}" >> workflow-report.md
+          echo "- **Skip Tests**: ${{ github.event.inputs.skip_tests }}" >> workflow-report.md
+          echo "- **Skip Quality**: ${{ needs.preflight.outputs.skip_quality }}" >> workflow-report.md
+          echo "- **Emergency Mode**: ${{ needs.preflight.outputs.emergency_mode }}" >> workflow-report.md
+          echo "" >> workflow-report.md
+          
+          echo "## Simulated Conditions" >> workflow-report.md
+          echo "- **Failure Simulation**: ${{ env.FAILURE_SIMULATION }}" >> workflow-report.md
+          echo "- **Failure Probability**: ${{ env.FAILURE_PROBABILITY }}%" >> workflow-report.md
+          echo "- **Latency Simulation**: ${{ env.LATENCY_SIMULATION }}" >> workflow-report.md
+          echo "- **Latency Severity**: ${{ env.LATENCY_SEVERITY }}" >> workflow-report.md
+          echo "" >> workflow-report.md
+          
+          echo "## Job Results" >> workflow-report.md
+          echo "- **Preflight**: ${{ needs.preflight.result }}" >> workflow-report.md
+          echo "- **Build**: Not available in this context" >> workflow-report.md
+          echo "- **Test**: Not available in this context" >> workflow-report.md
+          echo "- **Quality**: Not available in this context" >> workflow-report.md
+          echo "- **Publish**: Not available in this context" >> workflow-report.md
+          echo "- **Deploy**: ${{ needs.deploy.result }}" >> workflow-report.md
+          echo "" >> workflow-report.md
+          
+          echo "## Notes" >> workflow-report.md
+          echo "This report was generated automatically as part of the CI/CD observability demo." >> workflow-report.md
+          if [ "${{ env.FAILURE_SIMULATION }}" != "none" ] || [ "${{ env.LATENCY_SIMULATION }}" != "none" ]; then
+            echo "" >> workflow-report.md
+            echo "⚠️ **This run contained simulated failures or latency issues for demonstration purposes.**" >> workflow-report.md
+          fi
+
+      - name: Upload workflow report
+        uses: actions/upload-artifact@v3
+        with:
+          name: workflow-observability-report
+          path: workflow-report.md
+          retention-days: 30

@@ -1,0 +1,30 @@
+{
+  "name": "github-ci-cd-observability",
+  "version": "1.0.0",
+  "description": "Demo project showcasing GitHub Actions CI/CD Observability",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest",
+    "build": "bash ./scripts/build.sh",
+    "deploy": "bash ./scripts/deploy.sh",
+    "quality": "bash ./scripts/quality-check.sh",
+    "publish": "bash ./scripts/publish.sh"
+  },
+  "keywords": [
+    "github",
+    "actions",
+    "ci-cd",
+    "observability",
+    "demo"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "jest": "^29.5.0"
+  },
+  "jest": {
+    "testEnvironment": "node"
+  }
+}
