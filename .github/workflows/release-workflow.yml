@@ -319,7 +319,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-${{ matrix.os }}
           path: artifacts/
@@ -345,7 +345,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build-artifacts-ubuntu-latest
           path: artifacts/
@@ -581,7 +581,7 @@ jobs:
           fi
 
       - name: Upload quality reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: quality-reports
           path: reports/
@@ -597,7 +597,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
       
       - name: Simulate publish latency
         if: ${{ env.LATENCY_SIMULATION == 'network-issues' }}
@@ -696,7 +696,7 @@ jobs:
           # In a real workflow, you would use the GitHub API or actions/create-release
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-${{ needs.preflight.outputs.version }}
           path: |
@@ -720,7 +720,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: release-${{ needs.preflight.outputs.version }}
           path: release/
@@ -905,7 +905,7 @@ jobs:
           cat notification.txt
 
       - name: Upload notification summary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: workflow-summary
           path: notification.txt
@@ -960,14 +960,14 @@ jobs:
           fi
 
       - name: Upload workflow report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: workflow-observability-report
           path: workflow-report.md
           retention-days: 30
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-${{ needs.preflight.outputs.version }}
           path: |
