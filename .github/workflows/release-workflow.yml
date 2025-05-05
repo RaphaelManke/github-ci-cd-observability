@@ -910,7 +910,7 @@ jobs:
           name: workflow-summary
           path: notification.txt
           retention-days: 7
-          
+
       - name: Generate workflow observability report
         run: |
           echo "# GitHub CI/CD Workflow Observability Report" > workflow-report.md
@@ -964,4 +964,13 @@ jobs:
         with:
           name: workflow-observability-report
           path: workflow-report.md
+          retention-days: 30
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-${{ needs.preflight.outputs.version }}
+          path: |
+            release-notes.md
+            publication-history/
           retention-days: 30
