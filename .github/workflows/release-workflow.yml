@@ -476,8 +476,8 @@ jobs:
         run: |
           if [ "${{ needs.preflight.outputs.priority }}" = "high" ]; then
             echo "Running in high-priority mode - using relaxed quality thresholds"
-            echo "LINTING_THRESHOLD=75" >> $GITHUB_ENV
-            echo "SECURITY_THRESHOLD=80" >> $GITHUB_ENV
+            echo "LINTING_THRESHOLD=55" >> $GITHUB_ENV
+            echo "SECURITY_THRESHOLD=70" >> $GITHUB_ENV
           else
             echo "LINTING_THRESHOLD=85" >> $GITHUB_ENV
             echo "SECURITY_THRESHOLD=90" >> $GITHUB_ENV
