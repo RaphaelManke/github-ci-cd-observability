@@ -40,3 +40,5 @@ When triggering the workflow manually, you can configure:
 6. Submit to run the workflow
 
 This demo is designed to showcase GitHub Actions observability features for complex CI/CD pipelines.
+
+Update
